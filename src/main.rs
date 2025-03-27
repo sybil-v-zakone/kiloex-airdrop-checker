@@ -1,5 +1,5 @@
 use futures::future::join_all;
-use reqwest::{Client, redirect::Policy};
+use reqwest::{Client, Proxy, redirect::Policy};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,10 +18,11 @@ struct Data {
 async fn get_airdrop_amount_with_retry(
     address: &str,
     max_retries: u32,
+    proxy: Option<String>,
 ) -> Result<f64, reqwest::Error> {
     let mut retries = 0;
     loop {
-        match get_airdrop_amount(address).await {
+        match get_airdrop_amount(address, proxy.clone()).await {
             Ok(amount) => return Ok(amount),
             Err(e) if retries < max_retries => {
                 eprintln!(
@@ -39,8 +40,14 @@ async fn get_airdrop_amount_with_retry(
     }
 }
 
-async fn get_airdrop_amount(address: &str) -> Result<f64, reqwest::Error> {
-    let client = Client::builder().redirect(Policy::none()).build().unwrap();
+async fn get_airdrop_amount(address: &str, proxy: Option<String>) -> Result<f64, reqwest::Error> {
+    let mut client_builder = Client::builder().redirect(Policy::none());
+
+    if let Some(proxy_url) = proxy {
+        client_builder = client_builder.proxy(Proxy::all(format!("http://{}", proxy_url))?);
+    }
+
+    let client = client_builder.build()?;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -81,25 +88,37 @@ pub async fn read_lines(path: impl AsRef<Path>) -> Result<Vec<String>, std::io::
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const ADDRESSES_PATH_KEY: &str = "data/addresses.txt";
+    const PROXIES_PATH_KEY: &str = "data/proxies.txt";
     const MAX_RETRIES: u32 = 10;
 
     let addresses = match read_lines(ADDRESSES_PATH_KEY).await {
-        Ok(addrs) => addrs,
+        Ok(addresses) => addresses,
         Err(e) => {
             eprintln!("Error reading addresses file: {}", e);
             return Ok(());
         }
     };
 
-    let futures = addresses.iter().map(|address| async move {
-        match get_airdrop_amount_with_retry(address, MAX_RETRIES).await {
-            Ok(amount) => {
-                println!("Address {}: {} KILO", address, amount);
-                Some(amount)
-            }
-            Err(e) => {
-                eprintln!("Failed after retries for address {}: {}", address, e);
-                None
+    let proxies = match read_lines(PROXIES_PATH_KEY).await {
+        Ok(proxies) if !proxies.is_empty() => proxies,
+        _ => Vec::new(),
+    };
+
+    let mut proxy_iter = proxies.into_iter().cycle();
+
+    let futures = addresses.iter().map(|address| {
+        let proxy = proxy_iter.next();
+
+        async move {
+            match get_airdrop_amount_with_retry(address, MAX_RETRIES, proxy.clone()).await {
+                Ok(amount) => {
+                    println!("Address {}: {} KILO", address, amount);
+                    Some(amount)
+                }
+                Err(e) => {
+                    eprintln!("Failed after retries for address {}: {}", address, e);
+                    None
+                }
             }
         }
     });
